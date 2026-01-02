@@ -1,10 +1,12 @@
 """
 Telegram Proxy Node Listener - 主程序入口
 支持 Bot 模式和 User 模式的代理节点监听转发程序
+支持自定义群组和自动加载所有群组两种监听模式
 """
 
 import sys
 from pathlib import Path
+from typing import Optional, List, Dict, Union
 
 # 添加当前目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
@@ -12,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram import idle
+from pyrogram.enums import ChatType
 
-from typing import Optional, List
 from config import load_config, BotConfig
 from parser import extract_nodes, contains_nodes
 from forwarder import NodeForwarder
@@ -25,117 +27,173 @@ config: Optional[BotConfig] = None
 logger = None
 forwarder: Optional[NodeForwarder] = None
 app: Optional[Client] = None
+chat_id_map: Dict[Union[int, str], dict] = {}  # 群组信息缓存
 
 
-def create_client(config: BotConfig) -> Client:
-    """
-    创建 Pyrogram 客户端
+def create_client(cfg: BotConfig) -> Client:
+    """创建 Pyrogram 客户端"""
+    session_path = Path(__file__).parent / cfg.mode.session_name
 
-    Args:
-        config: 配置对象
-
-    Returns:
-        配置好的 Pyrogram 客户端
-    """
-    # 获取 session 文件路径
-    session_path = Path(__file__).parent / config.mode.session_name
-
-    # 基本参数
     client_params = {
         "name": str(session_path),
-        "api_id": config.telegram.api_id,
-        "api_hash": config.telegram.api_hash,
+        "api_id": cfg.telegram.api_id,
+        "api_hash": cfg.telegram.api_hash,
     }
 
-    # 根据模式添加不同的参数
-    if config.is_bot_mode:
-        if not config.telegram.bot_token:
+    if cfg.is_bot_mode:
+        if not cfg.telegram.bot_token:
             raise ValueError("Bot 模式需要配置 bot_token")
-        client_params["bot_token"] = config.telegram.bot_token
+        client_params["bot_token"] = cfg.telegram.bot_token
         logger.info("运行模式: Bot")
     else:
         logger.info("运行模式: User (Userbot)")
         logger.info("首次运行需要登录验证，请按提示输入手机号和验证码")
 
-    # 代理配置
-    if config.proxy.enabled:
+    if cfg.proxy.enabled:
         proxy_config = {
-            "scheme": config.proxy.type,
-            "hostname": config.proxy.host,
-            "port": config.proxy.port,
+            "scheme": cfg.proxy.type,
+            "hostname": cfg.proxy.host,
+            "port": cfg.proxy.port,
         }
-        if config.proxy.username and config.proxy.password:
-            proxy_config["username"] = config.proxy.username
-            proxy_config["password"] = config.proxy.password
-
+        if cfg.proxy.username and cfg.proxy.password:
+            proxy_config["username"] = cfg.proxy.username
+            proxy_config["password"] = cfg.proxy.password
         client_params["proxy"] = proxy_config
-        logger.info(f"已启用代理: {config.proxy.type}://{config.proxy.host}:{config.proxy.port}")
+        logger.info(f"已启用代理: {cfg.proxy.type}://{cfg.proxy.host}:{cfg.proxy.port}")
 
     return Client(**client_params)
 
 
-def check_message_filter(text: str, config: BotConfig) -> bool:
-    """
-    检查消息是否符合过滤条件
-
-    Args:
-        text: 消息文本
-        config: 配置对象
-
-    Returns:
-        是否应该处理该消息
-    """
+def check_message_filter(text: str, cfg: BotConfig) -> bool:
+    """检查消息是否符合过滤条件"""
     if not text:
         return False
 
     # 排除关键词检查
-    if config.filter.exclude_keywords:
-        for keyword in config.filter.exclude_keywords:
+    if cfg.filter.exclude_keywords:
+        for keyword in cfg.filter.exclude_keywords:
             if keyword.lower() in text.lower():
                 return False
 
     # 只转发节点消息
-    if config.filter.nodes_only:
+    if cfg.filter.nodes_only:
         if not contains_nodes(text):
             return False
-    # 关键词过滤
-    elif config.filter.keywords:
-        has_keyword = any(
-            kw.lower() in text.lower()
-            for kw in config.filter.keywords
-        )
+    elif cfg.filter.keywords:
+        has_keyword = any(kw.lower() in text.lower() for kw in cfg.filter.keywords)
         if not has_keyword:
             return False
 
     return True
 
 
-def register_handlers(app: Client, config: BotConfig, forwarder: NodeForwarder):
-    """
-    注册消息处理器
+def get_chat_type_name(chat_type) -> str:
+    """获取群组类型名称"""
+    type_map = {
+        ChatType.CHANNEL: "channel",
+        ChatType.SUPERGROUP: "supergroup",
+        ChatType.GROUP: "group",
+        ChatType.PRIVATE: "private",
+        ChatType.BOT: "bot",
+    }
+    return type_map.get(chat_type, str(chat_type).lower())
 
-    Args:
-        app: Pyrogram 客户端
-        config: 配置对象
-        forwarder: 转发器对象
-    """
 
-    @app.on_message(filters.chat(config.source_chats))
-    async def handle_message(client: Client, message: Message):
+def should_monitor_chat(chat, cfg: BotConfig) -> bool:
+    """判断是否应该监听该群组"""
+    chat_id = chat.id
+
+    # 检查是否在排除列表中
+    if chat_id in cfg.monitor.exclude_chats:
+        return False
+    if hasattr(chat, 'username') and chat.username:
+        if f"@{chat.username}" in cfg.monitor.exclude_chats:
+            return False
+
+    # 检查群组类型
+    if cfg.monitor.chat_types:
+        chat_type = get_chat_type_name(chat.type)
+        if chat_type not in cfg.monitor.chat_types:
+            return False
+
+    # 排除目标群组（避免循环转发）
+    if chat_id in cfg.forward.target_chats:
+        return False
+    if hasattr(chat, 'username') and chat.username:
+        if f"@{chat.username}" in cfg.forward.target_chats:
+            return False
+
+    return True
+
+
+async def load_dialogs_and_setup(client: Client, cfg: BotConfig) -> List[int]:
+    """
+    加载对话列表并设置监听群组
+
+    Returns:
+        监听群组 ID 列表
+    """
+    global chat_id_map
+
+    logger.info("正在同步对话列表...")
+    dialog_count = 0
+    source_chats = []
+
+    async for dialog in client.get_dialogs():
+        dialog_count += 1
+        chat = dialog.chat
+        chat_id = chat.id
+
+        # 缓存群组信息
+        chat_info = {
+            "id": chat_id,
+            "title": getattr(chat, 'title', getattr(chat, 'first_name', str(chat_id))),
+            "username": chat.username,
+            "type": get_chat_type_name(chat.type)
+        }
+        chat_id_map[chat_id] = chat_info
+        if chat.username:
+            chat_id_map[f"@{chat.username}"] = chat_info
+
+        # 根据模式确定是否监听
+        if cfg.is_auto_monitor:
+            # 自动模式：根据规则判断
+            if should_monitor_chat(chat, cfg):
+                source_chats.append(chat_id)
+        else:
+            # 自定义模式：检查是否在配置列表中
+            if chat_id in cfg.monitor.source_chats:
+                source_chats.append(chat_id)
+            elif chat.username and f"@{chat.username}" in cfg.monitor.source_chats:
+                source_chats.append(chat_id)
+
+    logger.info(f"已加载 {dialog_count} 个对话")
+    return source_chats
+
+
+def register_handlers(client: Client, cfg: BotConfig, fwd: NodeForwarder, source_chats: List[int]):
+    """注册消息处理器"""
+
+    # 使用 filters.chat 来过滤监听的群组
+    if source_chats:
+        chat_filter = filters.chat(source_chats)
+    else:
+        # 如果没有群组，使用一个永远不匹配的过滤器
+        chat_filter = filters.chat([0])
+
+    @client.on_message(chat_filter)
+    async def handle_message(c: Client, message: Message):
         """处理来自监听群组的消息"""
         try:
-            # 获取消息文本
             text = message.text or message.caption or ""
 
-            # 检查消息过滤
-            if not check_message_filter(text, config):
+            if not check_message_filter(text, cfg):
                 return
 
-            # 提取节点（如果需要）
             nodes: List[str] = []
-            if config.filter.nodes_only or config.forward.forward_mode == "extract":
+            if cfg.filter.nodes_only or cfg.forward.forward_mode == "extract":
                 nodes = extract_nodes(text)
-                if config.filter.nodes_only and not nodes:
+                if cfg.filter.nodes_only and not nodes:
                     return
 
             chat_title = getattr(message.chat, 'title', '未知群组')
@@ -145,142 +203,128 @@ def register_handlers(app: Client, config: BotConfig, forwarder: NodeForwarder):
             else:
                 logger.info(f"从 [{chat_title}] 收到符合条件的消息")
 
-            # 转发消息
-            result = await forwarder.forward_message(message, nodes)
-            logger.info(
-                f"转发完成: 成功 {result['success']}, 失败 {result['failed']}"
-            )
+            result = await fwd.forward_message(message, nodes)
+            logger.info(f"转发完成: 成功 {result['success']}, 失败 {result['failed']}")
 
         except Exception as e:
             logger.error(f"处理消息时出错: {e}")
 
-    # Bot 模式特有的命令处理
-    if config.is_bot_mode:
-        @app.on_message(filters.command("start") & filters.private)
-        async def cmd_start(client: Client, message: Message):
-            """处理 /start 命令"""
-            mode_text = "Bot 模式" if config.is_bot_mode else "用户模式"
+    # Bot 模式命令
+    if cfg.is_bot_mode:
+        @client.on_message(filters.command("start") & filters.private)
+        async def cmd_start(c: Client, message: Message):
+            mode_text = "Bot 模式" if cfg.is_bot_mode else "用户模式"
+            monitor_mode = "自动加载" if cfg.is_auto_monitor else "自定义"
             await message.reply_text(
                 f"🤖 **Telegram 消息转发器**\n\n"
-                f"当前运行模式: {mode_text}\n\n"
-                "我会监听指定群组的消息，自动识别并转发代理节点。\n\n"
-                "**支持的节点类型:**\n"
-                "• VMess / VLESS\n"
-                "• Trojan\n"
-                "• Shadowsocks (SS/SSR)\n"
-                "• Hysteria / Hysteria2\n"
-                "• TUIC / WireGuard\n\n"
-                "使用 /status 查看运行状态\n"
-                "使用 /help 查看帮助"
+                f"运行模式: {mode_text}\n"
+                f"监听模式: {monitor_mode}\n"
+                f"监听群组数: {len(source_chats)}\n\n"
+                "使用 /status 查看详细状态"
             )
 
-        @app.on_message(filters.command("status") & filters.private)
-        async def cmd_status(client: Client, message: Message):
-            """处理 /status 命令"""
-            forward_mode = "提取节点" if config.forward.forward_mode == "extract" else "直接转发"
-            nodes_only = "是" if config.filter.nodes_only else "否"
+        @client.on_message(filters.command("status") & filters.private)
+        async def cmd_status(c: Client, message: Message):
+            forward_mode = "提取节点" if cfg.forward.forward_mode == "extract" else "直接转发"
+            nodes_only = "是" if cfg.filter.nodes_only else "否"
+            monitor_mode = "自动加载" if cfg.is_auto_monitor else "自定义"
 
             status_text = (
                 "📊 **运行状态**\n\n"
-                f"🔄 运行模式: {'Bot' if config.is_bot_mode else 'User'}\n"
-                f"🔍 监听群组数: {len(config.source_chats)}\n"
-                f"📤 目标群组数: {len(config.forward.target_chats)}\n"
+                f"🔄 运行模式: {'Bot' if cfg.is_bot_mode else 'User'}\n"
+                f"📡 监听模式: {monitor_mode}\n"
+                f"🔍 监听群组数: {len(source_chats)}\n"
+                f"📤 目标群组数: {len(cfg.forward.target_chats)}\n"
                 f"📋 转发模式: {forward_mode}\n"
                 f"🔗 仅节点消息: {nodes_only}\n"
-                f"🌐 代理状态: {'已启用' if config.proxy.enabled else '未启用'}\n\n"
+                f"🌐 代理状态: {'已启用' if cfg.proxy.enabled else '未启用'}\n\n"
                 "✅ 运行正常"
             )
             await message.reply_text(status_text)
 
-        @app.on_message(filters.command("help") & filters.private)
-        async def cmd_help(client: Client, message: Message):
-            """处理 /help 命令"""
-            help_text = (
-                "📖 **帮助信息**\n\n"
-                "**可用命令:**\n"
-                "/start - 显示欢迎信息\n"
-                "/status - 查看运行状态\n"
-                "/help - 显示此帮助\n\n"
-                "**配置说明:**\n"
-                "• `run_mode`: bot 或 user\n"
-                "• `forward_mode`: extract 或 forward\n"
-                "• `nodes_only`: 是否只转发节点消息\n\n"
-                "详细配置请查看 config.ini 文件"
-            )
-            await message.reply_text(help_text)
+        @client.on_message(filters.command("list") & filters.private)
+        async def cmd_list(c: Client, message: Message):
+            """列出监听的群组"""
+            if not source_chats:
+                await message.reply_text("当前没有监听任何群组")
+                return
+
+            lines = ["📋 **监听群组列表**\n"]
+            for i, chat_id in enumerate(source_chats[:20], 1):
+                info = chat_id_map.get(chat_id, {})
+                title = info.get('title', str(chat_id))
+                chat_type = info.get('type', 'unknown')
+                lines.append(f"{i}. [{chat_type}] {title}")
+
+            if len(source_chats) > 20:
+                lines.append(f"\n... 等共 {len(source_chats)} 个群组")
+
+            await message.reply_text("\n".join(lines))
 
 
 async def start_app():
     """启动应用"""
-    global app, forwarder
+    global app, forwarder, config, chat_id_map
 
     await app.start()
 
-    # 获取当前用户/机器人信息
+    # 获取当前用户信息
     me = await app.get_me()
     if config.is_bot_mode:
         logger.info(f"已登录: @{me.username} (Bot)")
     else:
-        name = me.first_name
+        name = me.first_name or ""
         if me.last_name:
             name += f" {me.last_name}"
         username = f"@{me.username}" if me.username else ""
         logger.info(f"已登录: {name} {username}")
 
-    # User 模式下，先获取对话列表来缓存 peer 信息
-    if config.is_user_mode:
-        logger.info("正在同步对话列表（首次可能较慢）...")
-        dialog_count = 0
-        chat_map = {}  # 用于快速查找
-        async for dialog in app.get_dialogs():
-            dialog_count += 1
-            chat_map[dialog.chat.id] = dialog.chat
-            if hasattr(dialog.chat, 'username') and dialog.chat.username:
-                chat_map[f"@{dialog.chat.username}"] = dialog.chat
-        logger.info(f"已加载 {dialog_count} 个对话")
+    # 加载对话并确定监听群组
+    source_chats = await load_dialogs_and_setup(app, config)
 
-        # 解析监听群组
-        logger.info("正在解析监听群组...")
-        for chat_id in config.source_chats:
-            if chat_id in chat_map:
-                chat = chat_map[chat_id]
-                title = getattr(chat, 'title', getattr(chat, 'first_name', str(chat_id)))
-                logger.info(f"  ✓ {title} ({chat.id})")
-            else:
-                logger.warning(f"  ✗ 未找到 {chat_id}（请确认已加入该群组）")
-
-        # 解析目标群组
-        logger.info("正在解析目标群组...")
-        for chat_id in config.forward.target_chats:
-            if chat_id in chat_map:
-                chat = chat_map[chat_id]
-                title = getattr(chat, 'title', getattr(chat, 'first_name', str(chat_id)))
-                logger.info(f"  ✓ {title} ({chat.id})")
-                forwarder._resolved_chats[chat_id] = True
-                forwarder._chat_info[chat_id] = title
-            else:
-                logger.warning(f"  ✗ 未找到 {chat_id}（请确认已加入该群组）")
-                forwarder._resolved_chats[chat_id] = False
+    if config.is_auto_monitor:
+        logger.info(f"自动监听模式: 已加载 {len(source_chats)} 个群组")
+        if config.monitor.chat_types:
+            logger.info(f"  群组类型过滤: {', '.join(config.monitor.chat_types)}")
+        if config.monitor.exclude_chats:
+            logger.info(f"  排除群组数: {len(config.monitor.exclude_chats)}")
     else:
-        # Bot 模式使用原来的解析方式
-        await forwarder.resolve_all_targets()
+        logger.info(f"自定义监听模式: {len(source_chats)} 个群组")
 
-        logger.info("正在解析监听群组...")
-        for chat_id in config.source_chats:
-            try:
-                chat = await app.get_chat(chat_id)
-                logger.info(f"  ✓ {chat.title} ({chat_id})")
-            except Exception as e:
-                logger.warning(f"  ✗ 无法解析 {chat_id}: {e}")
+    # 显示监听群组
+    logger.info("监听群组列表:")
+    for chat_id in source_chats[:10]:
+        info = chat_id_map.get(chat_id, {})
+        title = info.get('title', str(chat_id))
+        chat_type = info.get('type', 'unknown')
+        logger.info(f"  ✓ [{chat_type}] {title}")
+    if len(source_chats) > 10:
+        logger.info(f"  ... 等共 {len(source_chats)} 个群组")
+
+    # 解析目标群组
+    logger.info("目标群组列表:")
+    for chat_id in config.forward.target_chats:
+        if chat_id in chat_id_map:
+            info = chat_id_map[chat_id]
+            logger.info(f"  ✓ {info['title']}")
+            forwarder._resolved_chats[chat_id] = True
+            forwarder._chat_info[chat_id] = info['title']
+        else:
+            logger.warning(f"  ✗ 未找到 {chat_id}")
+            forwarder._resolved_chats[chat_id] = False
+
+    if not source_chats:
+        logger.warning("警告: 没有可监听的群组！")
+
+    # 注册处理器
+    register_handlers(app, config, forwarder, source_chats)
 
     logger.info("=" * 50)
     logger.info("启动完成，正在监听消息...")
     logger.info("按 Ctrl+C 退出")
     logger.info("=" * 50)
 
-    # 保持运行
     await idle()
-
     await app.stop()
     logger.info("程序已退出")
 
@@ -289,14 +333,11 @@ def main():
     """主函数"""
     global config, logger, forwarder, app
 
-    # 确定配置文件路径
     config_path = Path(__file__).parent / "config.ini"
 
     try:
-        # 加载配置
         config = load_config(str(config_path))
 
-        # 初始化日志
         log_file = Path(__file__).parent / config.logging.file
         logger = setup_logger(
             name="tgbot",
@@ -309,32 +350,28 @@ def main():
         logger.info("=" * 50)
 
         # 验证配置
-        if not config.source_chats:
-            logger.error("未配置监听群组 (source_chats)")
+        if not config.is_auto_monitor and not config.monitor.source_chats:
+            logger.error("自定义模式下未配置监听群组 (source_chats)")
+            logger.info("提示: 设置 monitor_mode = auto 可自动加载所有群组")
             sys.exit(1)
 
         if not config.forward.target_chats:
             logger.error("未配置目标群组 (target_chats)")
             sys.exit(1)
 
-        logger.info(f"监听群组数: {len(config.source_chats)}")
+        monitor_mode = "自动加载" if config.is_auto_monitor else "自定义"
+        logger.info(f"监听模式: {monitor_mode}")
         logger.info(f"目标群组数: {len(config.forward.target_chats)}")
         logger.info(f"转发模式: {config.forward.forward_mode}")
 
-        # 创建客户端
         app = create_client(config)
 
-        # 初始化转发器
         forwarder = NodeForwarder(
             app,
             config.forward.target_chats,
             config.forward.forward_mode
         )
 
-        # 注册处理器
-        register_handlers(app, config, forwarder)
-
-        # 启动
         logger.info("正在连接 Telegram 服务器...")
         app.run(start_app())
 

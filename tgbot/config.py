@@ -4,8 +4,8 @@
 
 import configparser
 from pathlib import Path
-from dataclasses import dataclass
-from typing import List, Optional, Union
+from dataclasses import dataclass, field
+from typing import List, Optional, Union, Set
 
 
 @dataclass
@@ -21,6 +21,15 @@ class ModeConfig:
     """运行模式配置"""
     run_mode: str  # 'bot' 或 'user'
     session_name: str
+
+
+@dataclass
+class MonitorConfig:
+    """监听配置"""
+    monitor_mode: str  # 'custom' 或 'auto'
+    source_chats: List[Union[int, str]]
+    exclude_chats: List[Union[int, str]]
+    chat_types: Set[str]  # 要监听的群组类型
 
 
 @dataclass
@@ -61,11 +70,14 @@ class BotConfig:
     """机器人完整配置"""
     telegram: TelegramConfig
     mode: ModeConfig
-    source_chats: List[Union[int, str]]
+    monitor: MonitorConfig
     forward: ForwardConfig
     filter: FilterConfig
     proxy: ProxyConfig
     logging: LoggingConfig
+
+    # 运行时填充的动态群组列表
+    _dynamic_source_chats: List[Union[int, str]] = field(default_factory=list)
 
     @property
     def is_bot_mode(self) -> bool:
@@ -77,16 +89,26 @@ class BotConfig:
         """是否为用户模式"""
         return self.mode.run_mode.lower() == 'user'
 
+    @property
+    def is_auto_monitor(self) -> bool:
+        """是否为自动监听模式"""
+        return self.monitor.monitor_mode.lower() == 'auto'
+
+    @property
+    def source_chats(self) -> List[Union[int, str]]:
+        """获取监听群组列表"""
+        if self.is_auto_monitor and self._dynamic_source_chats:
+            return self._dynamic_source_chats
+        return self.monitor.source_chats
+
+    def set_dynamic_chats(self, chats: List[Union[int, str]]):
+        """设置动态群组列表（auto 模式使用）"""
+        self._dynamic_source_chats = chats
+
 
 def parse_chat_ids(chat_str: str) -> List[Union[int, str]]:
     """
     解析群组 ID 字符串为列表（支持数字 ID 或 @username）
-
-    Args:
-        chat_str: 逗号分隔的群组 ID 字符串
-
-    Returns:
-        群组 ID 列表（整数或用户名字符串）
     """
     if not chat_str or not chat_str.strip():
         return []
@@ -97,49 +119,34 @@ def parse_chat_ids(chat_str: str) -> List[Union[int, str]]:
         if not chat_id:
             continue
 
-        # 如果是 @username 格式
         if chat_id.startswith("@"):
             result.append(chat_id)
         else:
-            # 尝试解析为整数
             try:
                 result.append(int(chat_id))
             except ValueError:
-                # 如果不是数字，当作用户名处理
                 result.append(f"@{chat_id}" if not chat_id.startswith("@") else chat_id)
 
     return result
 
 
 def parse_keywords(keyword_str: str) -> List[str]:
-    """
-    解析关键词字符串为列表
-
-    Args:
-        keyword_str: 逗号分隔的关键词字符串
-
-    Returns:
-        关键词列表
-    """
+    """解析关键词字符串为列表"""
     if not keyword_str or not keyword_str.strip():
         return []
-
     return [kw.strip() for kw in keyword_str.split(",") if kw.strip()]
+
+
+def parse_chat_types(type_str: str) -> Set[str]:
+    """解析群组类型字符串为集合"""
+    if not type_str or not type_str.strip():
+        return set()  # 空集合表示所有类型
+    return {t.strip().lower() for t in type_str.split(",") if t.strip()}
 
 
 def load_config(config_path: str = "config.ini") -> BotConfig:
     """
     加载并解析配置文件
-
-    Args:
-        config_path: 配置文件路径
-
-    Returns:
-        BotConfig 配置对象
-
-    Raises:
-        FileNotFoundError: 配置文件不存在
-        ValueError: 配置值无效
     """
     path = Path(config_path)
     if not path.exists():
@@ -162,8 +169,13 @@ def load_config(config_path: str = "config.ini") -> BotConfig:
         session_name=config.get("mode", "session_name", fallback="tg_forwarder").strip()
     )
 
-    # 解析监听群组
-    source_chats = parse_chat_ids(config.get("monitor", "source_chats", fallback=""))
+    # 解析监听配置
+    monitor = MonitorConfig(
+        monitor_mode=config.get("monitor", "monitor_mode", fallback="custom").strip().lower(),
+        source_chats=parse_chat_ids(config.get("monitor", "source_chats", fallback="")),
+        exclude_chats=parse_chat_ids(config.get("monitor", "exclude_chats", fallback="")),
+        chat_types=parse_chat_types(config.get("monitor", "chat_types", fallback=""))
+    )
 
     # 解析转发配置
     forward = ForwardConfig(
@@ -199,7 +211,7 @@ def load_config(config_path: str = "config.ini") -> BotConfig:
     return BotConfig(
         telegram=telegram,
         mode=mode,
-        source_chats=source_chats,
+        monitor=monitor,
         forward=forward,
         filter=filter_config,
         proxy=proxy,
