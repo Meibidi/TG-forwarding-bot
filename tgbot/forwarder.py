@@ -18,24 +18,32 @@ ChatId = Union[int, str]
 class NodeForwarder:
     """节点消息转发器"""
 
-    def __init__(self, client: Client, target_chats: List[ChatId]):
+    def __init__(
+        self,
+        client: Client,
+        target_chats: List[ChatId],
+        forward_mode: str = "extract"
+    ):
         """
         初始化转发器
 
         Args:
             client: Pyrogram 客户端实例
             target_chats: 目标群组 ID 列表
+            forward_mode: 转发模式 ('extract' 或 'forward')
         """
         self.client = client
         self.target_chats = target_chats
+        self.forward_mode = forward_mode
         self._resolved_chats: Dict[ChatId, bool] = {}
+        self._chat_info: Dict[ChatId, str] = {}  # 缓存群组名称
 
     async def resolve_chat(self, chat_id: ChatId) -> bool:
         """
-        解析群组，确保 Bot 可以访问该群组
+        解析群组，确保客户端可以访问该群组
 
         Args:
-            chat_id: 群组 ID
+            chat_id: 群组 ID（数字或 @username）
 
         Returns:
             是否成功解析
@@ -46,38 +54,86 @@ class NodeForwarder:
         try:
             # 尝试获取群组信息来解析 peer
             chat = await self.client.get_chat(chat_id)
-            logger.info(f"成功解析群组: {chat.title} ({chat_id})")
+            chat_title = getattr(chat, 'title', str(chat_id))
+            self._chat_info[chat_id] = chat_title
+            logger.info(f"成功解析群组: {chat_title} ({chat_id})")
             self._resolved_chats[chat_id] = True
             return True
         except PeerIdInvalid:
-            logger.error(f"无法解析群组 {chat_id}: Bot 可能未加入该群组")
-            self._resolved_chats[chat_id] = False
-            return False
+            # 尝试通过获取对话记录来解析
+            try:
+                logger.info(f"尝试通过对话记录解析 {chat_id}...")
+                async for dialog in self.client.get_dialogs():
+                    if dialog.chat.id == chat_id or (
+                        hasattr(dialog.chat, 'username') and
+                        dialog.chat.username and
+                        f"@{dialog.chat.username}" == str(chat_id)
+                    ):
+                        chat_title = getattr(dialog.chat, 'title', str(chat_id))
+                        self._chat_info[chat_id] = chat_title
+                        logger.info(f"成功解析群组: {chat_title} ({chat_id})")
+                        self._resolved_chats[chat_id] = True
+                        return True
+
+                logger.error(f"无法解析群组 {chat_id}: 未加入该群组或ID错误")
+                logger.error(f"  提示: 请确认已加入该群组，或尝试使用 @username 格式")
+                self._resolved_chats[chat_id] = False
+                return False
+            except Exception as e2:
+                logger.error(f"解析群组 {chat_id} 失败: {e2}")
+                self._resolved_chats[chat_id] = False
+                return False
         except Exception as e:
             logger.error(f"解析群组 {chat_id} 失败: {e}")
             self._resolved_chats[chat_id] = False
             return False
 
-    async def resolve_all_targets(self):
-        """预先解析所有目标群组"""
-        logger.info("正在解析目标群组...")
-        for chat_id in self.target_chats:
-            await self.resolve_chat(chat_id)
+    async def resolve_all_targets(self) -> int:
+        """
+        预先解析所有目标群组
 
-    async def forward_nodes(
+        Returns:
+            成功解析的群组数量
+        """
+        logger.info("正在解析目标群组...")
+        success_count = 0
+        for chat_id in self.target_chats:
+            if await self.resolve_chat(chat_id):
+                success_count += 1
+
+        logger.info(f"目标群组解析完成: {success_count}/{len(self.target_chats)} 个成功")
+        return success_count
+
+    async def forward_message(self, message: Message, nodes: Optional[List[str]] = None) -> dict:
+        """
+        根据配置的模式转发消息
+
+        Args:
+            message: 原始消息对象
+            nodes: 提取的节点列表（仅 extract 模式需要）
+
+        Returns:
+            转发结果统计
+        """
+        if self.forward_mode == "forward":
+            return await self._forward_raw_message(message)
+        else:
+            return await self._forward_extracted_nodes(nodes or [], message)
+
+    async def _forward_extracted_nodes(
         self,
         nodes: List[str],
         source_message: Optional[Message] = None
     ) -> dict:
         """
-        转发节点到目标群组
+        提取节点后重新发送
 
         Args:
             nodes: 节点链接列表
-            source_message: 原始消息对象（可选）
+            source_message: 原始消息对象
 
         Returns:
-            转发结果统计 {"success": int, "failed": int, "details": list}
+            转发结果统计
         """
         if not nodes:
             return {"success": 0, "failed": 0, "details": []}
@@ -85,6 +141,18 @@ class NodeForwarder:
         # 构建转发消息
         message_text = self._build_message(nodes, source_message)
 
+        return await self._send_to_all_targets(message_text)
+
+    async def _forward_raw_message(self, message: Message) -> dict:
+        """
+        直接转发原始消息
+
+        Args:
+            message: 要转发的消息对象
+
+        Returns:
+            转发结果统计
+        """
         results = {
             "success": 0,
             "failed": 0,
@@ -92,21 +160,32 @@ class NodeForwarder:
         }
 
         for chat_id in self.target_chats:
+            # 检查群组是否已解析
+            if not self._resolved_chats.get(chat_id, False):
+                if not await self.resolve_chat(chat_id):
+                    results["failed"] += 1
+                    results["details"].append({
+                        "chat_id": chat_id,
+                        "status": "failed",
+                        "error": "无法解析群组"
+                    })
+                    continue
+
             try:
-                await self._send_to_chat(chat_id, message_text)
+                await message.forward(chat_id)
                 results["success"] += 1
                 results["details"].append({
                     "chat_id": chat_id,
                     "status": "success"
                 })
-                logger.info(f"成功转发到群组: {chat_id}")
+                chat_name = self._chat_info.get(chat_id, str(chat_id))
+                logger.info(f"成功转发到: {chat_name}")
 
             except FloodWait as e:
-                # 处理限流
-                logger.warning(f"FloodWait: 等待 {e.value} 秒后重试")
+                logger.warning(f"FloodWait: 等待 {e.value} 秒")
                 await asyncio.sleep(e.value)
                 try:
-                    await self._send_to_chat(chat_id, message_text)
+                    await message.forward(chat_id)
                     results["success"] += 1
                     results["details"].append({
                         "chat_id": chat_id,
@@ -119,7 +198,74 @@ class NodeForwarder:
                         "status": "failed",
                         "error": str(retry_error)
                     })
-                    logger.error(f"重试转发失败 {chat_id}: {retry_error}")
+
+            except Exception as e:
+                results["failed"] += 1
+                results["details"].append({
+                    "chat_id": chat_id,
+                    "status": "failed",
+                    "error": str(e)
+                })
+                logger.error(f"转发消息到 {chat_id} 失败: {e}")
+
+        return results
+
+    async def _send_to_all_targets(self, text: str) -> dict:
+        """
+        发送消息到所有目标群组
+
+        Args:
+            text: 要发送的消息文本
+
+        Returns:
+            发送结果统计
+        """
+        results = {
+            "success": 0,
+            "failed": 0,
+            "details": []
+        }
+
+        for chat_id in self.target_chats:
+            # 检查群组是否已解析
+            if not self._resolved_chats.get(chat_id, False):
+                if not await self.resolve_chat(chat_id):
+                    results["failed"] += 1
+                    results["details"].append({
+                        "chat_id": chat_id,
+                        "status": "failed",
+                        "error": "无法解析群组"
+                    })
+                    continue
+
+            try:
+                await self._send_to_chat(chat_id, text)
+                results["success"] += 1
+                results["details"].append({
+                    "chat_id": chat_id,
+                    "status": "success"
+                })
+                chat_name = self._chat_info.get(chat_id, str(chat_id))
+                logger.info(f"成功发送到: {chat_name}")
+
+            except FloodWait as e:
+                logger.warning(f"FloodWait: 等待 {e.value} 秒后重试")
+                await asyncio.sleep(e.value)
+                try:
+                    await self._send_to_chat(chat_id, text)
+                    results["success"] += 1
+                    results["details"].append({
+                        "chat_id": chat_id,
+                        "status": "success"
+                    })
+                except Exception as retry_error:
+                    results["failed"] += 1
+                    results["details"].append({
+                        "chat_id": chat_id,
+                        "status": "failed",
+                        "error": str(retry_error)
+                    })
+                    logger.error(f"重试发送失败 {chat_id}: {retry_error}")
 
             except ChatWriteForbidden:
                 results["failed"] += 1
@@ -146,7 +292,7 @@ class NodeForwarder:
                     "status": "failed",
                     "error": str(e)
                 })
-                logger.error(f"转发到 {chat_id} 失败: {e}")
+                logger.error(f"发送到 {chat_id} 失败: {e}")
 
         return results
 
@@ -201,50 +347,15 @@ class NodeForwarder:
 
         return "\n".join(lines)
 
+    # 兼容旧接口
+    async def forward_nodes(
+        self,
+        nodes: List[str],
+        source_message: Optional[Message] = None
+    ) -> dict:
+        """兼容旧接口"""
+        return await self._forward_extracted_nodes(nodes, source_message)
+
     async def forward_raw_message(self, message: Message) -> dict:
-        """
-        直接转发原始消息
-
-        Args:
-            message: 要转发的消息对象
-
-        Returns:
-            转发结果统计
-        """
-        results = {
-            "success": 0,
-            "failed": 0,
-            "details": []
-        }
-
-        for chat_id in self.target_chats:
-            try:
-                await message.forward(chat_id)
-                results["success"] += 1
-                results["details"].append({
-                    "chat_id": chat_id,
-                    "status": "success"
-                })
-            except FloodWait as e:
-                logger.warning(f"FloodWait: 等待 {e.value} 秒")
-                await asyncio.sleep(e.value)
-                try:
-                    await message.forward(chat_id)
-                    results["success"] += 1
-                except Exception as retry_error:
-                    results["failed"] += 1
-                    results["details"].append({
-                        "chat_id": chat_id,
-                        "status": "failed",
-                        "error": str(retry_error)
-                    })
-            except Exception as e:
-                results["failed"] += 1
-                results["details"].append({
-                    "chat_id": chat_id,
-                    "status": "failed",
-                    "error": str(e)
-                })
-                logger.error(f"转发消息到 {chat_id} 失败: {e}")
-
-        return results
+        """兼容旧接口"""
+        return await self._forward_raw_message(message)
